@@ -1,5 +1,5 @@
 /* ov.c — Win+Tab style overview for xfwm4 on X11 (xfwm4 compositor must be enabled)
- * build:  gcc -O2 -o ov.bin ov.c $(pkg-config --cflags --libs x11 xcomposite xrender xft xinerama xdamage)
+ * build:  gcc -O2 -o ov.bin ov.c $(pkg-config --cflags --libs x11 xcomposite xrender xft fontconfig xinerama xdamage)
  * usage:  ov.bin          toggle the overview (talks to the daemon if one is running, otherwise runs one-shot)
  *         ov.bin -d       daemon: keeps named window pixmaps cached, so minimised windows and windows on
  *                         other desktops still have thumbnails and opening the overview is instant.
@@ -33,13 +33,14 @@
 #define DESKW 1    /* thickness of the current-desktop outline */
 #define FPS 60     /* max redraw rate for live thumbnail updates and fades */
 #define FADEMS 150 /* outline fade in/out time */
-#define BGA 0xa800 /* background opacity of the window area (0 = transparent, 0xffff = opaque black) */
+#define BGA 0xd800 /* background opacity of the window area (0 = transparent, 0xffff = opaque black) */
 #define TOPA 0xf400 /* background opacity of the desktop strip */
 #define TH 220     /* window thumbnail height (constant; windows are never upscaled past 1:1) */
 #define HOVERMS 0   /* hover time over a desktop before switching to it */
 #define STRIP 26   /* title strip height */
 #define ICON 18    /* icon size */
-#define FONT "Fixed-10"
+#define FONT "Fixed-10" /* a fontconfig pattern; the whole fontconfig-sorted candidate list (so your fonts.conf fallbacks, e.g. Dotum12) is used for per-glyph fallback */
+#define MAXF 8    /* how many fonts from that list to open */
 #define FX(x) ((XFixed)((x) * 65536))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -51,7 +52,7 @@ char *atomnames[] = { "_NET_CLIENT_LIST_STACKING", "_NET_CURRENT_DESKTOP", "_NET
 typedef struct { Window frame; Pixmap pix; Picture pic; Damage dmg; int w, h; } Cache;
 typedef struct { Window client, frame; Cache *c; Picture icon; int iw, ih, fx, fy, fw, fh, desk, hidden, x, y, w, h, row; float oa; char title[160]; } Win;
 
-Display *D; Window R, W; Atom A[NATOMS]; Picture P, half; XftFont *font; XftDraw *xd; XftColor white;
+Display *D; Window R, W; Atom A[NATOMS]; Picture P, half; XftFont *font, *fonts[MAXF]; int nf; XftDraw *xd; XftColor white;
 int S, sw, sh, mw, mh, shown, daemon_, dmgbase, dirty, closehov = -1, xw, pfrev, hoverd = -1, kb, ndesk, cur, nw, ns, nc, sel = -1, scroll, top, aw, ah, cont, dragi = -1, dragging, ox, oy, px, py, dtw, dth, dx0;
 long lastdraw, hovert; Window pfocus; Cache cache[MAXW], rootpm, *wp; Win wins[MAXW]; int show[MAXW]; char names[MAXD][64]; float da[MAXD];
 
@@ -186,17 +187,35 @@ int fade(float *v, int on, long dt) { float t = on ? 1 : 0, d = (float)dt / FADE
 
 void clip(int x, int y, int w, int h) { XRectangle r = {x, y, MAX(w, 0), MAX(h, 0)}; XRenderSetPictureClipRectangles(D, P, 0, 0, &r, 1); XftDrawSetClipRectangles(xd, 0, 0, &r, 1); }
 
-void text(char *s, int x, int y) { XftDrawStringUtf8(xd, &white, font, x, y, (FcChar8*)s, strlen(s)); }
+void openfonts(void)
+{
+	FcPattern *p = FcNameParse((FcChar8*)FONT); FcResult r; FcConfigSubstitute(0, p, FcMatchPattern); XftDefaultSubstitute(D, S, p);
+	FcFontSet *fs = FcFontSort(0, p, FcTrue, 0, &r);
+	for (int i = 0; fs && i < fs->nfont && nf < MAXF; i++) { XftFont *f = XftFontOpenPattern(D, FcFontRenderPrepare(0, p, fs->fonts[i])); if (f) fonts[nf++] = f; }
+	FcPatternDestroy(p); font = nf ? fonts[0] : 0; if (fs) FcFontSetDestroy(fs);
+}
+
+int text(char *s, int x, int y, int draw) /* draws (draw=1) or measures UTF-8 text with per-glyph font fallback; returns width */
+{
+	int w = 0, l; FcChar32 u; XGlyphInfo g;
+	for (; *s && (l = FcUtf8ToUcs4((FcChar8*)s, &u, strlen(s))) > 0; s += l)
+	{
+		XftFont *f = font; for (int i = 0; i < nf; i++) if (XftCharExists(D, fonts[i], u)) { f = fonts[i]; break; }
+		if (draw) XftDrawString32(xd, &white, f, x + w, y, &u, 1);
+		XftTextExtents32(D, f, &u, 1, &g); w += g.xOff;
+	}
+	return w;
+}
 
 void drawdesk(int d, long dt)
 {
-	int x = dx0 + d * (dtw + GAP), y = GAP; double s = (double)dtw / sw; XGlyphInfo g;
+	int x = dx0 + d * (dtw + GAP), y = GAP; double s = (double)dtw / sw;
 	clip(x, y, dtw, dth); fill(x, y, dtw, dth, 0, 0, 0, 0xffff);
 	if (wp && wp->pic) blit(wp->pic, wp->w, wp->h, s, x, y, 0);
 	for (int i = 0; i < nw; i++) { Win *w = &wins[i]; if (!w->hidden && (w->desk == d || w->desk < 0) && PIC(w)) blit(PIC(w), w->c->w, w->c->h, s, x + w->fx * s, y + w->fy * s, 0); }
 	clip(x - DESKW, y - DESKW, dtw + 2 * DESKW, dth + DESKW + GAP + font->height);
 	dirty |= fade(&da[d], d == cur, dt); box(x, y, dtw, dth, DESKW, da[d]);
-	XftTextExtentsUtf8(D, font, (FcChar8*)names[d], strlen(names[d]), &g); text(names[d], x + (dtw - (int)g.width) / 2, y + dth + GAP / 2 + font->ascent);
+	text(names[d], x + (dtw - text(names[d], 0, 0, 0)) / 2, y + dth + GAP / 2 + font->ascent, 1);
 }
 
 long now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000 + t.tv_nsec / 1000000; }
@@ -206,7 +225,7 @@ int hitclose(int i, int x, int y) { Win *w = i >= 0 ? &wins[show[i]] : 0; return
 void draw(void)
 {
 	if (!shown) return;
-	long t = now(), dt = MIN(t - lastdraw, 1000 / FPS); lastdraw = t; dirty = 0; XGlyphInfo g; XftTextExtentsUtf8(D, font, (FcChar8*)"\xc3\x97", 2, &g); xw = g.width;
+	long t = now(), dt = MIN(t - lastdraw, 1000 / FPS); lastdraw = t; dirty = 0; xw = text("\xc3\x97", 0, 0, 0);
 	XRenderColor bg = {0, 0, 0, BGA}, tb = {0, 0, 0, TOPA}; XRenderFillRectangle(D, PictOpSrc, P, &bg, 0, 0, mw, mh); XRenderFillRectangle(D, PictOpSrc, P, &tb, 0, 0, mw, top - GAP);
 	for (int d = 0; d < ndesk; d++) drawdesk(d, dt);
 	clip(0, top - SELW, mw, ah + SELW);
@@ -216,9 +235,9 @@ void draw(void)
 		fill(w->x, w->y, w->w, STRIP, 0, 0, 0, 0xa000); /* title strip sits above the thumbnail */
 		if (PIC(w)) blit(PIC(w), w->c->w, w->c->h, (double)w->w / w->c->w, w->x, w->y + STRIP, 0); else fill(w->x, w->y + STRIP, w->w, w->h, 0x3000, 0x3000, 0x3000, 0xffff);
 		if (i == closehov) fill(w->x + w->w - STRIP, w->y, STRIP, STRIP, 0xc000, 0x1000, 0x1000, 0xffff);
-		text("\xc3\x97", w->x + w->w - (STRIP + xw) / 2, w->y + (STRIP + font->ascent - font->descent) / 2); /* × */
+		text("\xc3\x97", w->x + w->w - (STRIP + xw) / 2, w->y + (STRIP + font->ascent - font->descent) / 2, 1); /* × */
 		if (w->icon) blit(w->icon, w->iw, w->ih, (double)ICON / w->iw, w->x + 4, w->y + (STRIP - ICON) / 2, 0);
-		clip(w->x + ICON + 8, top - SELW, w->w - ICON - 12 - STRIP, ah + SELW); text(w->title, w->x + ICON + 8, w->y + (STRIP + font->ascent - font->descent) / 2); clip(0, top - SELW, mw, ah + SELW);
+		clip(w->x + ICON + 8, top - SELW, w->w - ICON - 12 - STRIP, ah + SELW); text(w->title, w->x + ICON + 8, w->y + (STRIP + font->ascent - font->descent) / 2, 1); clip(0, top - SELW, mw, ah + SELW);
 		dirty |= fade(&w->oa, i == sel && !dragging, dt); box(w->x, w->y, w->w, w->h + STRIP, SELW, w->oa);
 	}
 	clip(0, 0, mw, mh);
@@ -350,7 +369,7 @@ int main(int argc, char **argv)
 	W = XCreateWindow(D, R, 0, 0, 1, 1, 0, 32, InputOutput, vi.visual, CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWColormap | CWEventMask, &wa);
 	P = XRenderCreatePicture(D, W, XRenderFindVisualFormat(D, vi.visual), 0, 0);
 	XRenderColor hc = {0, 0, 0, 0xa000}, wc = {0xffff, 0xffff, 0xffff, 0xffff}; half = XRenderCreateSolidFill(D, &hc);
-	if (!(font = XftFontOpenName(D, S, FONT))) return fprintf(stderr, "cannot open font\n"), 1;
+	openfonts(); if (!font) return fprintf(stderr, "cannot open font\n"), 1;
 	xd = XftDrawCreate(D, W, vi.visual, wa.colormap); XftColorAllocValue(D, vi.visual, wa.colormap, &wc, &white);
 	XSetSelectionOwner(D, A[OWNER], W, CurrentTime);
 	XSelectInput(D, R, PropertyChangeMask | (daemon_ ? SubstructureNotifyMask : 0));
