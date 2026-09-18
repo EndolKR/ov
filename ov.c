@@ -133,7 +133,7 @@ void layout(void)
 	dth = DH; dtw = DH * sw / sh; if (ndesk * (dtw + GAP) - GAP > mw - 2 * GAP) { dtw = (mw - (ndesk + 1) * GAP) / ndesk; dth = dtw * sh / sw; }
 	dx0 = DESKLEFT ? GAP : (mw - ndesk * (dtw + GAP) + GAP) / 2; top = mode ? GAP : dth + font->height + 3 * GAP; aw = mw - 2 * GAP; ah = mh - top - GAP;
 	int h = TH + STRIP, rows = nrows = pack(h);
-	cont = rows * (h + GAP) - GAP + SELW; scroll = mode ? 0 : MAX(0, MIN(scroll, cont - ah)); int yo = mode ? MAX(ah - cont, 0) / 2 : 0;
+	cont = rows * (h + GAP) - GAP + SELW; scroll = MAX(0, MIN(scroll, cont - ah)); int yo = mode ? MAX(ah - cont, 0) / 2 : 0; /* switchers centre vertically while it fits, scroll once it doesn't */
 	for (int i = 0, j; i < ns; i = j) /* overview: top-left aligned; switcher: centred both ways */
 	{
 		int r = wins[show[i]].row, rw = -GAP; for (j = i; j < ns && wins[show[j]].row == r; j++) rw += wins[show[j]].w + GAP;
