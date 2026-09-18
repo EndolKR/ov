@@ -34,6 +34,7 @@
 #define DH 180     /* desktop thumbnail height (strip height = DH + font height + 3*GAP) */
 #define DESKLEFT 1 /* 1 = left-align the desktop strip, 0 = centre it */
 #define SELW 1     /* thickness of the selected-window outline */
+#define HOVA 0.35f /* opacity of the weaker outline on the window under the pointer (a click commits it; Enter/Alt-release use the active selection) */
 #define DESKW 1    /* thickness of the current-desktop outline */
 #define ALTMOD Mod1Mask /* modifier whose release activates the window in alt-tab (-t) mode */
 #define FPS 60     /* max redraw rate for live thumbnail updates and fades */
@@ -59,7 +60,7 @@ typedef struct { Window frame; Pixmap pix; Picture pic; Damage dmg; int w, h; } 
 typedef struct { Window client, frame; Cache *c; Picture icon; int iw, ih, fx, fy, fw, fh, desk, hidden, x, y, w, h, row; float oa; char title[160]; } Win;
 
 Display *D; Window R, W; Atom A[NATOMS]; Picture P, half; XftFont *font, *fonts[MAXF]; int nf; XftDraw *xd; XftColor white;
-int S, sw, sh, mw, mh, mx, my, shown, daemon_, dmgbase, dirty, closehov = -1, xw, pfrev, hoverd = -1, kb, mode, grabbed, kcs[3], ndesk, cur, nw, ns, nc, sel = -1, scroll, top, aw, ah, cont, dragi = -1, dragging, ox, oy, px, py, dtw, dth, dx0;
+int S, sw, sh, mw, mh, mx, my, shown, daemon_, dmgbase, dirty, closehov = -1, xw, pfrev, hoverd = -1, hov = -1, nrows, mode, grabbed, kcs[3], ndesk, cur, nw, ns, nc, sel = -1, scroll, top, aw, ah, cont, dragi = -1, dragging, ox, oy, px, py, dtw, dth, dx0;
 long lastdraw, hovert; Window pfocus; Cache cache[MAXW], rootpm, *wp; Win wins[MAXW]; int show[MAXW]; char names[MAXD][64]; float da[MAXD];
 
 int xerr(Display *d, XErrorEvent *e) { return 0; }
@@ -131,7 +132,7 @@ void layout(void)
 {
 	dth = DH; dtw = DH * sw / sh; if (ndesk * (dtw + GAP) - GAP > mw - 2 * GAP) { dtw = (mw - (ndesk + 1) * GAP) / ndesk; dth = dtw * sh / sw; }
 	dx0 = DESKLEFT ? GAP : (mw - ndesk * (dtw + GAP) + GAP) / 2; top = mode ? GAP : dth + font->height + 3 * GAP; aw = mw - 2 * GAP; ah = mh - top - GAP;
-	int h = TH + STRIP, rows = pack(h);
+	int h = TH + STRIP, rows = nrows = pack(h);
 	cont = rows * (h + GAP) - GAP + SELW; scroll = mode ? 0 : MAX(0, MIN(scroll, cont - ah)); int yo = mode ? MAX(ah - cont, 0) / 2 : 0;
 	for (int i = 0, j; i < ns; i = j) /* overview: top-left aligned; switcher: centred both ways */
 	{
@@ -194,7 +195,7 @@ void box(int x, int y, int w, int h, int t, float a) /* outline at opacity a */
 	if (v > 0) XRenderFillRectangles(D, PictOpOver, P, &c, r, 4);
 }
 
-int fade(float *v, int on, long dt) { float t = on ? 1 : 0, d = (float)dt / FADEMS; *v = *v < t ? MIN(*v + d, t) : MAX(*v - d, t); return *v != t; } /* returns 1 while still animating */
+int fade(float *v, float t, long dt) { float d = (float)dt / FADEMS; *v = *v < t ? MIN(*v + d, t) : MAX(*v - d, t); return *v != t; } /* returns 1 while still animating */
 
 void clip(int x, int y, int w, int h) { XRectangle r = {x, y, MAX(w, 0), MAX(h, 0)}; XRenderSetPictureClipRectangles(D, P, 0, 0, &r, 1); XftDrawSetClipRectangles(xd, 0, 0, &r, 1); }
 
@@ -251,7 +252,7 @@ void draw(void)
 		text("\xc3\x97", w->x + w->w - (STRIP + xw) / 2, w->y + (STRIP + font->ascent - font->descent) / 2, 1); /* × */
 		if (w->icon) blit(w->icon, w->iw, w->ih, (double)ICON / w->iw, w->x + 4, w->y + (STRIP - ICON) / 2, 0);
 		clip(w->x + ICON + 8, top - SELW, w->w - ICON - 12 - STRIP, ah + SELW); text(w->title, w->x + ICON + 8, w->y + (STRIP + font->ascent - font->descent) / 2, 1); clip(0, top - SELW, mw, ah + SELW);
-		dirty |= fade(&w->oa, i == sel && !dragging, dt); box(w->x, w->y, w->w, w->h + STRIP, SELW, w->oa);
+		dirty |= fade(&w->oa, dragging ? 0 : i == sel ? 1 : i == hov ? HOVA : 0, dt); box(w->x, w->y, w->w, w->h + STRIP, SELW, w->oa);
 	}
 	clip(0, 0, mw, mh);
 	if (dragging) { Win *w = &wins[show[dragi]]; if (PIC(w)) blit(PIC(w), w->c->w, w->c->h, (double)w->w / w->c->w / 2, px - w->w / 4, py - w->h / 4, half); }
@@ -284,7 +285,7 @@ void reveal(int m) /* fullscreen on the monitor under the pointer; m: 0 overview
 	mode = m; mw = sw; mh = sh; XQueryPointer(D, R, &a, &b, &rx, &ry, &wx, &wy, &mk);
 	for (int i = 0; si && i < n; i++) if (rx >= si[i].x_org && rx < si[i].x_org + si[i].width && ry >= si[i].y_org && ry < si[i].y_org + si[i].height) { x = si[i].x_org; y = si[i].y_org; mw = si[i].width; mh = si[i].height; }
 	if (si) XFree(si);
-	mx = x; my = y; XMoveResizeWindow(D, W, x, y, mw, mh); scroll = 0; dragi = -1; dragging = 0; closehov = -1; hoverd = -1; rebuild(); kb = !!mode; sel = mode ? MIN(1, ns - 1) : -1; shown = 1; XMapRaised(D, W);
+	mx = x; my = y; XMoveResizeWindow(D, W, x, y, mw, mh); scroll = 0; dragi = -1; dragging = 0; closehov = -1; hoverd = hov = -1; rebuild(); sel = mode ? MIN(1, ns - 1) : -1; shown = 1; XMapRaised(D, W);
 	grabbed = 0; if (mode) grab(); else { XGetInputFocus(D, &pfocus, &pfrev); XSetInputFocus(D, W, RevertToPointerRoot, CurrentTime); } /* switchers rely on the grab alone (the idle loop retries it and watches ALTMOD); the overview takes focus */
 }
 
@@ -310,12 +311,12 @@ void key(KeySym k, unsigned st)
 	else if ((k == XK_Up || k == XK_Down) && !s && ns) sel = 0;
 	else if (k == XK_Up || k == XK_Down)
 	{
-		int best = -1, bd = 1 << 30, cx = s->x + s->w / 2, tr = s->row + (k == XK_Down ? 1 : -1);
+		int best = -1, bd = 1 << 30, cx = s->x + s->w / 2, tr = (s->row + (k == XK_Down ? 1 : nrows - 1)) % nrows; /* wraps */
 		for (int i = 0; i < ns; i++) { Win *w = &wins[show[i]]; int d = abs(w->x + w->w / 2 - cx); if (w->row == tr && d < bd) bd = d, best = i; }
 		if (best >= 0) sel = best;
 	}
 	else return;
-	kb = 1; hoverd = -1; /* keyboard navigation: from now on the outline stays put when the pointer leaves */
+	hoverd = -1;
 	if (sel >= 0) { s = &wins[show[sel]]; if (s->y < top) scroll -= top - s->y; else if (s->y + s->h + STRIP > top + ah) scroll += s->y + s->h + STRIP - top - ah; layout(); }
 	draw();
 }
@@ -349,7 +350,7 @@ void motion(XMotionEvent *e)
 	if (dragi >= 0 && !dragging && abs(px - ox) + abs(py - oy) > 10) dragging = 1;
 	int h = hitwin(px, py), ch = hitclose(h, px, py) ? h : -1, d = hitdesk(px, py);
 	if (d != hoverd) { hoverd = d >= 0 && d != cur && !dragging ? d : -1; hovert = now(); } /* the idle loop switches desktop after HOVERMS */
-	if (dragging || (h >= 0 && h != sel) || (h < 0 && !kb && sel >= 0) || ch != closehov) { if (h >= 0 || !kb) sel = h; closehov = ch; draw(); }
+	if (dragging || h != hov || ch != closehov) { hov = h; closehov = ch; draw(); } /* hovering never moves the active selection */
 }
 
 void run(void)
