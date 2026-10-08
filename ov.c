@@ -4,7 +4,7 @@
  *         ov.bin -t       alt-tab switcher: bind to Alt+Tab (unbind xfwm4's "Cycle windows"); hold ALTMOD, Tab/Shift+Tab cycle, release ALTMOD to activate;
  *                         a quick tap (ALTMOD already up when it appears) activates the second window immediately
  *         ov.bin -s       sticky switcher: bind to e.g. KP_5; Tab/KP_5 advance, Shift+Tab/Shift+KP_5 go back, Enter/click activate, Esc cancel
- *                         (both switcher modes grab the keyboard while open; the overview does not)
+ *                         (both switcher modes grab only the keys they use, so media keys and other xfce shortcuts keep working; the overview grabs nothing)
  *         ov.bin -d       daemon: keeps named window pixmaps cached, so minimised windows and windows on
  *                         other desktops still have thumbnails and opening the overview is instant.
  *                         (X only lets you name the pixmap of a *viewable* window, so one-shot mode
@@ -16,6 +16,7 @@
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/keysym.h>
+#include <X11/XKBlib.h>
 #include <X11/Xft/Xft.h>
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xrender.h>
@@ -27,6 +28,9 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/select.h>
+#include <unistd.h>
+#include <signal.h>
+#include <X11/XF86keysym.h>
 
 #define MAXW 256   /* max windows / cached pixmaps */
 #define MAXD 32    /* max desktops */
@@ -48,6 +52,19 @@
 #define ICON 18    /* icon size */
 #define FONT "Fixed-10" /* a fontconfig pattern; the whole fontconfig-sorted candidate list (so your fonts.conf fallbacks, e.g. Dotum12) is used for per-glyph fallback */
 #define MAXF 8    /* how many fonts from that list to open */
+/* media keys while the alt-tab switcher (-t) is open: ALTMOD is held, so they arrive as e.g. Alt+XF86AudioRaiseVolume and xfce's
+   plain bindings don't match; the switcher grabs only the ALTMOD combinations and runs these instead (plain media keys still go to xfce) */
+struct { KeySym k; char *cmd; } media[] = {
+	{ XF86XK_AudioRaiseVolume, "pactl set-sink-volume @DEFAULT_SINK@ +5%" },
+	{ XF86XK_AudioLowerVolume, "pactl set-sink-volume @DEFAULT_SINK@ -5%" },
+	{ XF86XK_AudioMute,        "pactl set-sink-mute @DEFAULT_SINK@ toggle" },
+	{ XF86XK_AudioMicMute,     "pactl set-source-mute @DEFAULT_SOURCE@ toggle" },
+	{ XF86XK_AudioPlay,        "playerctl play-pause" },
+	{ XF86XK_AudioPause,       "playerctl pause" },
+	{ XF86XK_AudioStop,        "playerctl stop" },
+	{ XF86XK_AudioNext,        "playerctl next" },
+	{ XF86XK_AudioPrev,        "playerctl previous" },
+};
 #define FX(x) ((XFixed)((x) * 65536))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -60,7 +77,7 @@ typedef struct { Window frame; Pixmap pix; Picture pic; Damage dmg; int w, h; } 
 typedef struct { Window client, frame; Cache *c; Picture icon; int iw, ih, fx, fy, fw, fh, desk, hidden, x, y, w, h, row; float oa; char title[160]; } Win;
 
 Display *D; Window R, W; Atom A[NATOMS]; Picture P, half; XftFont *font, *fonts[MAXF]; int nf; XftDraw *xd; XftColor white;
-int S, sw, sh, mw, mh, mx, my, shown, daemon_, dmgbase, dirty, closehov = -1, xw, pfrev, hoverd = -1, hov = -1, nrows, mode, grabbed, kcs[3], ndesk, cur, nw, ns, nc, sel = -1, scroll, top, aw, ah, cont, dragi = -1, dragging, ox, oy, px, py, dtw, dth, dx0;
+int S, sw, sh, mw, mh, mx, my, shown, daemon_, dmgbase, dirty, closehov = -1, pfrev, hoverd = -1, hov = -1, nrows, mode, grabbed, ndesk, cur, nw, ns, nc, sel = -1, scroll, top, ah, dragi = -1, dragging, ox, oy, px, py, dtw, dth, dx0;
 long lastdraw, hovert; Window pfocus; Cache cache[MAXW], rootpm, *wp; Win wins[MAXW]; int show[MAXW]; char names[MAXD][64]; float da[MAXD];
 
 int xerr(Display *d, XErrorEvent *e) { return 0; }
@@ -90,16 +107,18 @@ void cfree(Cache *c) { if (c->pic) XRenderFreePicture(D, c->pic); if (c->pix) XF
 
 void cdel(Window f) { Cache *c = cfind(f); if (c) { cfree(c); *c = cache[--nc]; } }
 
-void cname(Window f) /* (re)name the frame's backing pixmap; only possible while viewable. The reference keeps the contents alive after unmap. */
+Cache *cname(Window f) /* (re)name the frame's backing pixmap; only possible while viewable. The reference keeps the contents alive after unmap. */
 {
 	XWindowAttributes a; Window r; int x, y; unsigned w, h, b, d; Cache *c;
-	if (!XGetWindowAttributes(D, f, &a) || a.map_state != IsViewable || a.override_redirect) return;
+	if (!XGetWindowAttributes(D, f, &a) || a.map_state != IsViewable || a.override_redirect) return 0;
 	Pixmap p = XCompositeNameWindowPixmap(D, f);
-	if (!XGetGeometry(D, p, &r, &x, &y, &w, &h, &b, &d)) return;
-	if (!(c = cfind(f))) { if (nc == MAXW) { XFreePixmap(D, p); return; } c = &cache[nc++]; *c = (Cache){f}; }
+	if (!XGetGeometry(D, p, &r, &x, &y, &w, &h, &b, &d)) return 0;
+	if (!(c = cfind(f))) { if (nc == MAXW) { XFreePixmap(D, p); return 0; } c = &cache[nc++]; *c = (Cache){f}; }
 	cfree(c); c->pix = p; c->w = w; c->h = h; c->pic = XRenderCreatePicture(D, p, XRenderFindVisualFormat(D, a.visual), 0, 0);
-	XRenderSetPictureFilter(D, c->pic, FilterBilinear, 0, 0); c->dmg = XDamageCreate(D, f, XDamageReportNonEmpty);
+	XRenderSetPictureFilter(D, c->pic, FilterBilinear, 0, 0); c->dmg = XDamageCreate(D, f, XDamageReportNonEmpty); return c;
 }
+
+Cache *cget(Window f) { Cache *c = cfind(f); return c ? c : cname(f); }
 
 Picture mkicon(Window cw, int *iw, int *ih)
 {
@@ -115,25 +134,19 @@ Picture mkicon(Window cw, int *iw, int *ih)
 	XFreePixmap(D, pm); XRenderSetPictureFilter(D, pic, FilterBilinear, 0, 0); return pic;
 }
 
-int pack(int h) /* greedy left-to-right rows at cell height h (= STRIP + thumbnail, never upscaled past 1:1); returns row count */
-{
-	int rows = 0, x = 0;
-	for (int i = 0; i < ns; i++)
-	{
-		Win *w = &wins[show[i]]; int cw = PIC(w) ? w->c->w : w->fw, ch = PIC(w) ? w->c->h : w->fh; double s = MIN((double)(h - STRIP) / MAX(ch, 1), 1.0);
-		w->w = MAX(cw * s, 1); w->h = MAX(ch * s, 1);
-		if (x && x + w->w > aw) { x = 0; rows++; }
-		w->row = rows; x += w->w + GAP;
-	}
-	return ns ? rows + 1 : 0;
-}
-
-void layout(void)
+void layout(void) /* greedy left-to-right rows of TH-high thumbnails (never upscaled past 1:1) */
 {
 	dth = DH; dtw = DH * sw / sh; if (ndesk * (dtw + GAP) - GAP > mw - 2 * GAP) { dtw = (mw - (ndesk + 1) * GAP) / ndesk; dth = dtw * sh / sw; }
-	dx0 = DESKLEFT ? GAP : (mw - ndesk * (dtw + GAP) + GAP) / 2; top = mode ? GAP : dth + font->height + 3 * GAP; aw = mw - 2 * GAP; ah = mh - top - GAP;
-	int h = TH + STRIP, rows = nrows = pack(h);
-	cont = rows * (h + GAP) - GAP + SELW; scroll = MAX(0, MIN(scroll, cont - ah)); int yo = mode ? MAX(ah - cont, 0) / 2 : 0; /* switchers centre vertically while it fits, scroll once it doesn't */
+	dx0 = DESKLEFT ? GAP : (mw - ndesk * (dtw + GAP) + GAP) / 2; top = mode ? GAP : dth + font->height + 3 * GAP; ah = mh - top - GAP;
+	int aw = mw - 2 * GAP, h = TH + STRIP, x = 0, r = 0;
+	for (int i = 0; i < ns; i++)
+	{
+		Win *w = &wins[show[i]]; int cw = PIC(w) ? w->c->w : w->fw, ch = PIC(w) ? w->c->h : w->fh; double s = MIN((double)TH / MAX(ch, 1), 1.0);
+		w->w = MAX(cw * s, 1); w->h = MAX(ch * s, 1);
+		if (x && x + w->w > aw) { x = 0; r++; }
+		w->row = r; x += w->w + GAP;
+	}
+	nrows = ns ? r + 1 : 0; int cont = nrows * (h + GAP) - GAP + SELW; scroll = MAX(0, MIN(scroll, cont - ah)); int yo = mode ? MAX(ah - cont, 0) / 2 : 0; /* switchers centre vertically while it fits, scroll once it doesn't */
 	for (int i = 0, j; i < ns; i = j) /* overview: top-left aligned; switcher: centred both ways */
 	{
 		int r = wins[show[i]].row, rw = -GAP; for (j = i; j < ns && wins[show[j]].row == r; j++) rw += wins[show[j]].w + GAP;
@@ -155,14 +168,14 @@ void rebuild(void)
 	for (i = 0; cl && i < n && nw < MAXW; i++)
 	{
 		Window cw = cl[i]; Atom *ty = (Atom*)prop(cw, A[TYPE], XA_ATOM, &m); int dock = has(ty, m, A[DOCK]), isdesk = has(ty, m, A[DESKTOP]); if (ty) XFree(ty);
-		if (isdesk) { Window f = frameof(cw); if (!(wp = cfind(f))) { cname(f); wp = cfind(f); } }
+		if (isdesk) wp = cget(frameof(cw));
 		if (dock || isdesk) continue;
 		Atom *st = (Atom*)prop(cw, A[STATE], XA_ATOM, &m); int skip = has(st, m, A[SKIPT]), hid = has(st, m, A[HIDDEN]); if (st) XFree(st);
 		if (skip) continue;
 		Win *w = &wins[nw]; *w = (Win){cw, frameof(cw)}; if (!w->frame) continue;
 		unsigned long d = card(cw, A[DESK], cur); w->hidden = hid; w->desk = d == 0xFFFFFFFF ? -1 : (int)d;
 		Window r; unsigned fw, fh, b, dp; if (!XGetGeometry(D, w->frame, &r, &w->fx, &w->fy, &fw, &fh, &b, &dp)) continue;
-		w->fw = fw; w->fh = fh; if (!(w->c = cfind(w->frame))) { cname(w->frame); w->c = cfind(w->frame); }
+		w->fw = fw; w->fh = fh; w->c = cget(w->frame);
 		w->icon = mkicon(cw, &w->iw, &w->ih); for (j = 0; j < (unsigned long)onw; j++) if (oc[j] == cw) w->oa = oo[j];
 		unsigned char *t = prop(cw, A[NAME], A[UTF8], &m); if (!t) t = prop(cw, XA_WM_NAME, XA_STRING, &m); snprintf(w->title, sizeof w->title, "%s", t ? (char*)t : ""); if (t) XFree(t);
 		XSelectInput(D, cw, PropertyChangeMask); nw++;
@@ -174,7 +187,9 @@ void rebuild(void)
 		if (rootpm.pix != *pm) { if (rootpm.pic) XRenderFreePicture(D, rootpm.pic); rootpm.pic = 0; if (XGetGeometry(D, *pm, &r, &x, &y, &w, &h, &b, &d)) { rootpm.pix = *pm; rootpm.w = w; rootpm.h = h; rootpm.pic = XRenderCreatePicture(D, *pm, XRenderFindVisualFormat(D, DefaultVisual(D, S)), 0, 0); XRenderSetPictureFilter(D, rootpm.pic, FilterBilinear, 0, 0); } }
 		wp = rootpm.pic ? &rootpm : 0; XFree(pm);
 	}
-	for (int h = 0; h < 2; h++) for (i = nw; i-- > 0;) if (wins[i].hidden == h && (wins[i].desk == cur || wins[i].desk < 0)) show[ns++] = i; /* alt-tab order: top of stack first, minimised last */
+	for (i = nw; i-- > 0;) if (wins[i].desk == cur || wins[i].desk < 0) show[ns++] = i; /* alt-tab order: top of stack first, minimised windows keep their place */
+	Window *ap = (Window*)prop(R, A[ACTIVE], XA_WINDOW, &m), act = ap ? *ap : 0; if (ap) XFree(ap);
+	for (i = 1; act && i < (unsigned long)ns; i++) if (wins[show[i]].client == act) { int t = show[i]; memmove(show + 1, show, i * sizeof *show); show[0] = t; break; } /* the focused window leads, even if the WM has not restacked yet (e.g. the instant after a minimise) */
 	for (dragi = -1, i = 0; dc && i < (unsigned long)ns; i++) if (wins[show[i]].client == dc) dragi = i;
 	if (dragi < 0) dragging = 0;
 	layout();
@@ -237,9 +252,9 @@ int hitclose(int i, int x, int y) { Win *w = i >= 0 ? &wins[show[i]] : 0; return
 void draw(void)
 {
 	if (!shown) return;
-	long t = now(), dt = MIN(t - lastdraw, 1000 / FPS); lastdraw = t; dirty = 0; xw = text("\xc3\x97", 0, 0, 0);
+	long t = now(), dt = MIN(t - lastdraw, 1000 / FPS); lastdraw = t; dirty = 0; int xw = text("\xc3\x97", 0, 0, 0);
 	XRenderColor bg = {0, 0, 0, mode ? SWA : BGA}, tb = {0, 0, 0, TOPA}, k = {0, 0, 0, mode ? 0 : 0xffff}; XRenderFillRectangle(D, PictOpSrc, P, &k, 0, 0, mw, mh);
-	if (!mode && wp && wp->pic) { XTransform id = {{{FX(1), 0, 0}, {0, FX(1), 0}, {0, 0, FX(1)}}}; XRenderSetPictureTransform(D, wp->pic, &id); XRenderComposite(D, PictOpSrc, wp->pic, 0, P, mx, my, 0, 0, 0, 0, mw, mh); } /* this monitor's part of the wallpaper as the backdrop */
+	if (!mode && wp && wp->pic) blit(wp->pic, wp->w, wp->h, 1, -mx, -my, 0); /* this monitor's part of the wallpaper as the backdrop */
 	XRenderFillRectangle(D, PictOpOver, P, &bg, 0, 0, mw, mh);
 	if (!mode) { XRenderFillRectangle(D, PictOpOver, P, &tb, 0, 0, mw, top - GAP); for (int d = 0; d < ndesk; d++) drawdesk(d, dt); }
 	clip(0, top - SELW, mw, ah + SELW);
@@ -269,13 +284,28 @@ void msg(Window w, Atom a, long d0, long d1)
 }
 
 void hide(int refocus) /* refocus: give focus back to what had it (cancel); when a window is being activated the WM sets focus itself and we must not fight it */
-{ if (refocus && !mode) XSetInputFocus(D, pfocus, pfrev, CurrentTime); XUnmapWindow(D, W); XUngrabKeyboard(D, CurrentTime); XFlush(D); shown = 0; if (!daemon_) exit(0); }
+{ if (refocus && !mode) XSetInputFocus(D, pfocus, pfrev, CurrentTime); XUnmapWindow(D, W); XUngrabKey(D, AnyKey, AnyModifier, R); XFlush(D); shown = 0; if (!daemon_) exit(0); }
 
 void activate(int i) { if (i >= 0 && i < ns) { msg(wins[show[i]].client, A[ACTIVE], 2, CurrentTime); hide(0); } else hide(1); }
 
 void key(KeySym k, unsigned st);
 
-void grab(void) { grabbed = XGrabKeyboard(D, W, 1, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess; } /* fails while xfce's own shortcut grab is still active (key held); the idle loop retries */
+void grabkeys(void) /* switchers: passive grabs on only the keys key() uses, so media keys etc. still reach xfce. Each modifier combination is grabbed separately,
+                       so one that xfce already holds (e.g. Alt+Tab, KP_5) just fails on its own (xfce then re-runs ov.bin, which advances via cmd) */
+{ /* only the modifiers that matter (Shift, ALTMOD, Ctrl) times the lock states (Caps, NumLock): a few hundred grabs instead of thousands, which made the switcher slow to appear */
+	KeySym ks[] = { XK_Tab, XK_Escape, XK_Return, XK_KP_Enter, XK_space, XK_Left, XK_Right, XK_Up, XK_Down, XK_KP_4, XK_KP_6, XK_KP_8, XK_KP_2, XK_KP_5,
+	                XK_1, XK_2, XK_3, XK_4, XK_5, XK_6, XK_7, XK_8, XK_9 };
+	unsigned nl = XkbKeysymToModifiers(D, XK_Num_Lock), locks[] = { 0, LockMask, nl, LockMask | nl }, nav[] = { 0, ShiftMask, ALTMOD, ALTMOD | ShiftMask }, ctl[] = { ControlMask, ControlMask | ALTMOD }, alt[] = { ALTMOD, ALTMOD | ShiftMask };
+	#define GRAB(kc, set) for (unsigned a = 0; a < sizeof set / sizeof *set; a++) for (unsigned l = 0; l < 4; l++) XGrabKey(D, kc, set[a] | locks[l], R, 0, GrabModeAsync, GrabModeAsync)
+	for (unsigned i = 0; i < sizeof ks / sizeof *ks; i++) { KeyCode kc = XKeysymToKeycode(D, ks[i]); if (kc) GRAB(kc, nav); }
+	KeyCode w = XKeysymToKeycode(D, XK_w); if (w) GRAB(w, ctl); /* Ctrl+W only, plain w stays free */
+	for (unsigned i = 0; mode == 1 && i < sizeof media / sizeof *media; i++) { KeyCode kc = XKeysymToKeycode(D, media[i].k); if (kc) GRAB(kc, alt); }
+	#undef GRAB
+}
+
+void grab(void) /* probe: succeeds once no other client holds the keyboard (xfce's shortcut grab lasts while the key that launched us is held); until then
+                   our key grabs can't fire, so the idle loop polls the keys that matter. Released at once, so unrelated keys keep going where they normally would */
+{ if ((grabbed = XGrabKeyboard(D, W, 0, GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess)) XUngrabKeyboard(D, CurrentTime); }
 
 unsigned mods(void) { int rx, ry, wx, wy; unsigned m; Window a, b; XQueryPointer(D, R, &a, &b, &rx, &ry, &wx, &wy, &m); return m; }
 
@@ -286,12 +316,11 @@ void reveal(int m) /* fullscreen on the monitor under the pointer; m: 0 overview
 	for (int i = 0; si && i < n; i++) if (rx >= si[i].x_org && rx < si[i].x_org + si[i].width && ry >= si[i].y_org && ry < si[i].y_org + si[i].height) { x = si[i].x_org; y = si[i].y_org; mw = si[i].width; mh = si[i].height; }
 	if (si) XFree(si);
 	mx = x; my = y; XMoveResizeWindow(D, W, x, y, mw, mh); scroll = 0; dragi = -1; dragging = 0; closehov = -1; hoverd = hov = -1; rebuild(); sel = mode ? MIN(1, ns - 1) : -1; shown = 1; XMapRaised(D, W);
-	grabbed = 0; if (mode) grab(); else { XGetInputFocus(D, &pfocus, &pfrev); XSetInputFocus(D, W, RevertToPointerRoot, CurrentTime); } /* switchers rely on the grab alone (the idle loop retries it and watches ALTMOD); the overview takes focus */
+	grabbed = 0; if (mode) { grabkeys(); grab(); } else { XGetInputFocus(D, &pfocus, &pfrev); XSetInputFocus(D, W, RevertToPointerRoot, CurrentTime); } /* switchers use key grabs (the idle loop watches ALTMOD); the overview takes focus */
 }
 
-void cmd(int c) /* IPC command: c - 1 is the mode to show; re-sending a switcher's command while it is open advances it */
+void cmd(int m) /* IPC command: the mode to show; re-sending a switcher's command while it is open advances it */
 {
-	int m = c - 1;
 	if (shown && mode == m && m) key(XK_Right, 0);
 	else if (shown && mode == m) hide(1);
 	else { if (shown) hide(0); reveal(m); }
@@ -300,20 +329,20 @@ void cmd(int c) /* IPC command: c - 1 is the mode to show; re-sending a switcher
 void key(KeySym k, unsigned st)
 {
 	Win *s = sel >= 0 ? &wins[show[sel]] : 0;
+	for (unsigned i = 0; i < sizeof media / sizeof *media; i++) if (k == media[i].k) { if (!fork()) { close(ConnectionNumber(D)); setsid(); execl("/bin/sh", "sh", "-c", media[i].cmd, (char*)0); _exit(127); } return; }
 	if (k == XK_Tab || (mode && (k == XK_KP_5 || k == XK_KP_Begin))) k = st & ShiftMask ? XK_Left : XK_Right;
 	k = k == XK_KP_8 || k == XK_KP_Up ? XK_Up : k == XK_KP_2 || k == XK_KP_Down ? XK_Down : k == XK_KP_4 || k == XK_KP_Left ? XK_Left : k == XK_KP_6 || k == XK_KP_Right ? XK_Right : k; /* numpad, with or without NumLock */
 	if (k == XK_Escape) { hide(1); return; }
 	else if (k == XK_w && st & ControlMask) { if (s) msg(s->client, A[CLOSE], CurrentTime, 2); return; }
-	else if (k == XK_Return || k == XK_space) { activate(sel); return; }
+	else if (k == XK_Return || k == XK_KP_Enter || k == XK_space) { activate(sel); return; }
 	else if (k >= XK_1 && k <= XK_9 && (int)(k - XK_1) < ndesk) { msg(R, A[CUR], k - XK_1, CurrentTime); hide(0); return; }
 	else if (k == XK_Right) sel = ns ? (sel + 1) % ns : -1;
 	else if (k == XK_Left) sel = ns ? (sel + ns - 1) % ns : -1;
-	else if ((k == XK_Up || k == XK_Down) && !s && ns) sel = 0;
-	else if (k == XK_Up || k == XK_Down)
+	else if ((k == XK_Up || k == XK_Down) && !s) sel = ns ? 0 : -1;
+	else if (k == XK_Up || k == XK_Down) /* nearest window in the row above/below, wrapping */
 	{
-		int best = -1, bd = 1 << 30, cx = s->x + s->w / 2, tr = (s->row + (k == XK_Down ? 1 : nrows - 1)) % nrows; /* wraps */
-		for (int i = 0; i < ns; i++) { Win *w = &wins[show[i]]; int d = abs(w->x + w->w / 2 - cx); if (w->row == tr && d < bd) bd = d, best = i; }
-		if (best >= 0) sel = best;
+		int bd = 1 << 30, cx = s->x + s->w / 2, tr = (s->row + (k == XK_Down ? 1 : nrows - 1)) % nrows;
+		for (int i = 0; i < ns; i++) { Win *w = &wins[show[i]]; int d = abs(w->x + w->w / 2 - cx); if (w->row == tr && d < bd) bd = d, sel = i; }
 	}
 	else return;
 	hoverd = -1;
@@ -353,6 +382,8 @@ void motion(XMotionEvent *e)
 	if (dragging || h != hov || ch != closehov) { hov = h; closehov = ch; draw(); } /* hovering never moves the active selection */
 }
 
+int down(char *km, KeySym s) { KeyCode k = XKeysymToKeycode(D, s); return km[k >> 3] >> (k & 7) & 1; }
+
 void run(void)
 {
 	XEvent e; Cache *c; Atom a; int fd = ConnectionNumber(D);
@@ -362,11 +393,10 @@ void run(void)
 		{
 			long t = now(), ms = 1L << 30;
 			if (mode == 1 && shown && !(mods() & ALTMOD)) { activate(sel); continue; } /* polled, so the release is caught even before our grab/focus is in place */
-			if (mode && shown && !grabbed) /* until our grab is in place keys go elsewhere (xfce's shortcut grab, the old window), so poll the ones that matter */
+			if (mode && shown && !grabbed) /* until our grabs can fire keys go elsewhere (xfce's shortcut grab, the old window), so poll the ones that matter */
 			{
 				char km[32]; XQueryKeymap(D, km); grab();
-				#define DOWN(k) (km[(k) >> 3] >> ((k) & 7) & 1)
-				if (DOWN(kcs[0]) || DOWN(kcs[1])) { activate(sel); continue; } else if (DOWN(kcs[2])) { hide(1); continue; }
+				if (down(km, XK_Return) || down(km, XK_KP_Enter)) { activate(sel); continue; } else if (down(km, XK_Escape)) { hide(1); continue; }
 			}
 			if (mode && shown && (mode == 1 || !grabbed)) ms = 5;
 			if (hoverd >= 0) { if (t >= hovert + HOVERMS) { if (hoverd != cur) msg(R, A[CUR], hoverd, CurrentTime); hoverd = -1; continue; } ms = hovert + HOVERMS - t; }
@@ -378,13 +408,13 @@ void run(void)
 		switch (e.type)
 		{
 		case Expose: if (!e.xexpose.count) draw(); break;
-		case KeyPress: key(XLookupKeysym(&e.xkey, 0), e.xkey.state); break;
+		case KeyPress: if (shown) key(XLookupKeysym(&e.xkey, 0), e.xkey.state); break;
 		case ButtonPress: button(&e.xbutton); break;
 		case ButtonRelease: release(&e.xbutton); break;
 		case MotionNotify: while (XCheckTypedWindowEvent(D, W, MotionNotify, &e)); motion(&e.xmotion); break;
 		case PropertyNotify:
 			a = e.xproperty.atom;
-			if (a == A[TOGGLE]) cmd(card(R, A[TOGGLE], 1));
+			if (a == A[TOGGLE]) cmd(card(R, A[TOGGLE], 0));
 			else if (shown && (a == A[STACK] || a == A[CUR] || a == A[NDESK] || a == A[DNAMES] || a == A[DESK] || a == A[STATE])) { rebuild(); if (!mode) XSetInputFocus(D, W, RevertToPointerRoot, CurrentTime); draw(); }
 			break;
 		case MapNotify: cname(e.xmap.window); break;
@@ -396,24 +426,23 @@ void run(void)
 
 int main(int argc, char **argv)
 {
-	daemon_ = argc > 1 && !strcmp(argv[1], "-d"); long c = argc > 1 && !strcmp(argv[1], "-t") ? 2 : argc > 1 && !strcmp(argv[1], "-s") ? 3 : 1;
+	daemon_ = argc > 1 && !strcmp(argv[1], "-d"); long m = argc > 1 && !strcmp(argv[1], "-t") ? 1 : argc > 1 && !strcmp(argv[1], "-s") ? 2 : 0;
 	if (!(D = XOpenDisplay(0))) return fprintf(stderr, "cannot open display\n"), 1;
-	XSetErrorHandler(xerr); S = DefaultScreen(D); R = RootWindow(D, S); sw = DisplayWidth(D, S); sh = DisplayHeight(D, S);
+	XSetErrorHandler(xerr); signal(SIGCHLD, SIG_IGN); /* no zombies from media commands */ S = DefaultScreen(D); R = RootWindow(D, S); sw = DisplayWidth(D, S); sh = DisplayHeight(D, S);
 	XInternAtoms(D, atomnames, NATOMS, 0, A); int ee; if (!XDamageQueryExtension(D, &dmgbase, &ee)) return fprintf(stderr, "no XDamage\n"), 1;
 	Window o = XGetSelectionOwner(D, A[OWNER]);
 	if (o && daemon_) return fprintf(stderr, "ov already running\n"), 1;
-	if (o) { XChangeProperty(D, R, A[TOGGLE], XA_CARDINAL, 32, PropModeReplace, (unsigned char*)&c, 1); XSync(D, 0); return 0; }
+	if (o) { XChangeProperty(D, R, A[TOGGLE], XA_CARDINAL, 32, PropModeReplace, (unsigned char*)&m, 1); XSync(D, 0); return 0; }
 	XVisualInfo vi; if (!XMatchVisualInfo(D, S, 32, TrueColor, &vi)) return fprintf(stderr, "no ARGB visual (is the compositor on?)\n"), 1;
 	XSetWindowAttributes wa = {.override_redirect = 1, .background_pixel = 0, .border_pixel = 0, .colormap = XCreateColormap(D, R, vi.visual, AllocNone), .event_mask = ExposureMask | KeyPressMask | ButtonPressMask | ButtonReleaseMask | PointerMotionMask};
 	W = XCreateWindow(D, R, 0, 0, 1, 1, 0, 32, InputOutput, vi.visual, CWOverrideRedirect | CWBackPixel | CWBorderPixel | CWColormap | CWEventMask, &wa);
 	P = XRenderCreatePicture(D, W, XRenderFindVisualFormat(D, vi.visual), 0, 0);
 	XRenderColor hc = {0, 0, 0, 0xa000}, wc = {0xffff, 0xffff, 0xffff, 0xffff}; half = XRenderCreateSolidFill(D, &hc);
-	kcs[0] = XKeysymToKeycode(D, XK_Return); kcs[1] = XKeysymToKeycode(D, XK_KP_Enter); kcs[2] = XKeysymToKeycode(D, XK_Escape);
 	openfonts(); if (!font) return fprintf(stderr, "cannot open font\n"), 1;
 	xd = XftDrawCreate(D, W, vi.visual, wa.colormap); XftColorAllocValue(D, vi.visual, wa.colormap, &wc, &white);
 	XSetSelectionOwner(D, A[OWNER], W, CurrentTime);
 	XSelectInput(D, R, PropertyChangeMask | (daemon_ ? SubstructureNotifyMask : 0));
 	if (daemon_) { Window r, p, *ch; unsigned n; if (XQueryTree(D, R, &r, &p, &ch, &n)) { for (unsigned i = 0; i < n; i++) cname(ch[i]); XFree(ch); } }
-	else reveal(c - 1);
+	else reveal(m);
 	run();
 }
